@@ -443,6 +443,7 @@ func prepareMigrationTasks() []*migration {
 		newMigration(364, "Add new table project_workflow", v29.AddProjectWorkflow),
 		newMigration(365, "Add Codespace tables", v29.AddCodespaceTables),
 		newMigration(366, "Add Pages support", v29.AddPagesTables),
+		newMigration(367, "Add Codespace Manager registration token table", v29.AddCodespaceManagerRegistrationTokenTable),
 	}
 	return preparedMigrations
 }

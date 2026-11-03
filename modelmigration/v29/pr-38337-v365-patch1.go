@@ -99,15 +99,6 @@ func (*codespaceManager) TableIndices() []*schemas.Index {
 }
 
 func AddCodespaceTables(_ context.Context, x base.EngineMigration) error {
-	type codespaceManagerRegistrationToken struct {
-		ID       int64
-		Token    string `xorm:"UNIQUE"`
-		UserID   int64  `xorm:"index"`
-		IsActive bool
-		Created  int64 `xorm:"created"`
-		Updated  int64 `xorm:"updated"`
-	}
-
 	type codespaceGiteaToken struct {
 		CodespaceID    int64  `xorm:"pk"`
 		TokenHash      string `xorm:"VARCHAR(100) NOT NULL UNIQUE"`
@@ -181,7 +172,6 @@ func AddCodespaceTables(_ context.Context, x base.EngineMigration) error {
 	if err := sess.Sync(
 		new(codespace),
 		new(codespaceManager),
-		new(codespaceManagerRegistrationToken),
 		new(codespaceGiteaToken),
 		new(codespaceSSHKey),
 		new(codespaceOpenToken),
