@@ -375,6 +375,7 @@ func TestFinalizeFailedDeletesCodespaceGitPublicKey(t *testing.T) {
 	keyID := loadServiceSSHKeyRelation(t, codespaceUUID).KeyID
 
 	outcome, err := FinalizeOperation(t.Context(), manager, FinalizeOperationOptions{
+		CodespaceID:       codespaceIDByUUID(t, codespaceUUID),
 		CodespaceUUID:     codespaceUUID,
 		OperationRVersion: 18,
 		OperationType:     codespacev1.OperationType_OPERATION_TYPE_CREATE,
@@ -452,17 +453,6 @@ func TestValidateGitTransports(t *testing.T) {
 		assert.ErrorContains(t, err, "[repository] DISABLE_HTTP_GIT=true")
 		assert.ErrorContains(t, err, "known hosts are required")
 	})
-}
-
-func configureGitTransportTestSettings(t *testing.T, protocol string, disableHTTPGit, disableSSH bool, knownHosts []string) {
-	t.Helper()
-	t.Cleanup(test.MockVariableValue(&setting.Repository.DisableHTTPGit, disableHTTPGit))
-	t.Cleanup(test.MockVariableValue(&setting.SSH.Disabled, disableSSH))
-	t.Cleanup(test.MockVariableValue(&setting.SSH.Domain, "gitea.example.com"))
-	t.Cleanup(test.MockVariableValue(&setting.SSH.Port, 22))
-	t.Cleanup(test.MockVariableValue(&setting.SSH.StartBuiltinServer, false))
-	t.Cleanup(test.MockVariableValue(&setting.Codespace.GitSSHKnownHosts, knownHosts))
-	t.Cleanup(test.MockVariableValue(&setting.Codespace.GitProtocol, protocol))
 }
 
 func configureServiceGitSSHHostKey(t *testing.T) {
