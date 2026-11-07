@@ -444,6 +444,10 @@ func prepareMigrationTasks() []*migration {
 		newMigration(365, "Add Codespace tables", v29.AddCodespaceTables),
 		newMigration(366, "Add Pages support", v29.AddPagesTables),
 		newMigration(367, "Add Codespace Manager registration token table", v29.AddCodespaceManagerRegistrationTokenTable),
+		newMigration(368, "Normalize legacy repository unit and login source JSON", v29.NormalizeLegacyConfigJSON),
+		newMigration(369, "Drop user_open_id table", v29.DropUserOpenIDTable),
+		newMigration(370, "Add latest_release_id to repository table", v29.AddLatestReleaseIDToRepository),
+		newMigration(371, "Drop obsolete Codespace queued timeout index", v29.DropCodespaceQueuedTimeoutIndex),
 	}
 	return preparedMigrations
 }
