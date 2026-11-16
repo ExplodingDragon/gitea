@@ -448,6 +448,8 @@ func prepareMigrationTasks() []*migration {
 		newMigration(369, "Drop user_open_id table", v29.DropUserOpenIDTable),
 		newMigration(370, "Add latest_release_id to repository table", v29.AddLatestReleaseIDToRepository),
 		newMigration(371, "Drop obsolete Codespace queued timeout index", v29.DropCodespaceQueuedTimeoutIndex),
+		newMigration(372, "Add unique index for team name", v29.AddUniqueTeamNameIndex),
+		newMigration(373, "Add runner_name to action_task", v29.AddRunnerNameToActionTask),
 	}
 	return preparedMigrations
 }
