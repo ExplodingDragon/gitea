@@ -257,7 +257,7 @@ func handleSettingsPostUpdate(ctx *context.Context) {
 	repo.IsTemplate = form.Template
 
 	if err := repo_service.UpdateRepository(ctx, repo, repo_service.UpdateRepositoryOptions{PathChanged: pathChanged}); err != nil {
-		ctx.ServerError("UpdateRepository", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 	log.Trace("Repository basic settings updated: %s/%s", ctx.Repo.Owner.Name, repo.Name)
@@ -687,7 +687,7 @@ func handleSettingsPostAdvanced(ctx *context.Context) {
 	}
 	if repoChanged {
 		if err := repo_service.UpdateRepository(ctx, repo, repo_service.UpdateRepositoryOptions{}); err != nil {
-			ctx.ServerError("UpdateRepository", err)
+			ctx.ServerErrorAuto(err)
 			return
 		}
 	}
