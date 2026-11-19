@@ -32,15 +32,19 @@ func TestSelfMigrationTail(t *testing.T) {
 	defer test.MockVariableValue(&preparedMigrations, nil)()
 	migrations := prepareMigrationTasks()
 
-	assert.EqualValues(t, 374, calcDBVersion(migrations))
+	assert.EqualValues(t, 375, calcDBVersion(migrations))
 
 	pending := getPendingMigrations(372, migrations)
-	require.Len(t, pending, 2)
+	require.Len(t, pending, 3)
 	assert.EqualValues(t, 372, pending[0].idNumber)
 	assert.Equal(t, "Add unique index for team name", pending[0].description)
 	assert.EqualValues(t, 373, pending[1].idNumber)
 	assert.Equal(t, "Add runner_name to action_task", pending[1].description)
 
-	require.Len(t, getPendingMigrations(373, migrations), 1)
-	assert.Empty(t, getPendingMigrations(374, migrations))
+	require.Len(t, getPendingMigrations(373, migrations), 2)
+	pending = getPendingMigrations(374, migrations)
+	require.Len(t, pending, 1)
+	assert.EqualValues(t, 374, pending[0].idNumber)
+	assert.Equal(t, "Reset legacy Codespace instances and update schema", pending[0].description)
+	assert.Empty(t, getPendingMigrations(375, migrations))
 }

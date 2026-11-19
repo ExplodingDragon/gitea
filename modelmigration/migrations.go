@@ -450,6 +450,7 @@ func prepareMigrationTasks() []*migration {
 		newMigration(371, "Drop obsolete Codespace queued timeout index", v29.DropCodespaceQueuedTimeoutIndex),
 		newMigration(372, "Add unique index for team name", v29.AddUniqueTeamNameIndex),
 		newMigration(373, "Add runner_name to action_task", v29.AddRunnerNameToActionTask),
+		newMigration(374, "Reset legacy Codespace instances and update schema", v29.ResetLegacyCodespaceInstancesAndUpdateSchema),
 	}
 	return preparedMigrations
 }
