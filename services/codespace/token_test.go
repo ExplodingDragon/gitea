@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	auth_model "gitea.dev/models/auth"
 	codespace_model "gitea.dev/models/codespace"
 	"gitea.dev/models/db"
 	"gitea.dev/models/perm"
@@ -24,11 +25,11 @@ import (
 )
 
 func requestRuntimeCredentials(ctx context.Context, manager *codespace_model.Manager, opts requestRuntimeCredentialsOptions) (*requestRuntimeCredentialsResult, error) {
-	if err := validateRuntimeAccessRequest(manager, opts.CodespaceUUID, opts.OperationRVersion); err != nil {
+	if err := validateRuntimeAccessRequest(manager, opts.CodespaceID, opts.OperationRVersion); err != nil {
 		return nil, err
 	}
 	var result *requestRuntimeCredentialsResult
-	err := globallock.LockAndDo(ctx, runtimeAccessLockKey(opts.CodespaceUUID), func(ctx context.Context) error {
+	err := globallock.LockAndDo(ctx, runtimeAccessLockKey(opts.CodespaceID), func(ctx context.Context) error {
 		prepared, err := prepareRuntimeAccessLocked(ctx, manager, opts)
 		if err == nil {
 			result = prepared.credentials
@@ -43,9 +44,9 @@ func TestRuntimeCredentialsCreateReturnsStableToken(t *testing.T) {
 
 	manager := insertServiceManager(t)
 	markServiceManagerOnline(t, manager, `[{"tag":"default"}]`)
-	codespaceUUID := "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+	codespaceID := int64(1140)
 	insertServiceCodespace(t, manager.ID, &codespace_model.Codespace{
-		UUID:                  codespaceUUID,
+		ID:                    codespaceID,
 		Status:                codespace_model.StatusCreating,
 		OperationRVersion:     7,
 		OperationTrigger:      codespace_model.OperationTriggerUser,
@@ -53,88 +54,33 @@ func TestRuntimeCredentialsCreateReturnsStableToken(t *testing.T) {
 		OperationStartedUnix:  11,
 		OperationDeadlineUnix: time.Now().Add(time.Hour).Unix(),
 	})
-	encryptedSecret, err := secret_module.EncryptSecret(setting.SecretKey, "runtime-value")
+	secretsEncrypted, err := encryptCreateSecrets(t.Context(), 1, false, []CreateSecretInput{{Name: "RUNTIME_SECRET", Source: SecretSourceCustom, Value: "runtime-value"}})
 	require.NoError(t, err)
-	userSecret := &codespace_model.UserSecret{UserID: 1, Name: "RUNTIME_SECRET", DataEncrypted: encryptedSecret, DataSize: 13}
-	require.NoError(t, db.Insert(t.Context(), userSecret))
-	require.NoError(t, db.Insert(t.Context(), &codespace_model.UserSecretRepository{SecretID: userSecret.ID, RepoID: 2}))
+	_, err = db.GetEngine(t.Context()).Where("id = ?", codespaceID).Cols("secrets_encrypted").Update(&codespace_model.Codespace{SecretsEncrypted: secretsEncrypted})
+	require.NoError(t, err)
 
-	first, err := requestRuntimeCredentials(t.Context(), manager, requestRuntimeCredentialsOptions{CodespaceUUID: codespaceUUID, OperationRVersion: 7})
+	first, err := requestRuntimeCredentials(t.Context(), manager, requestRuntimeCredentialsOptions{CodespaceID: codespaceID, OperationRVersion: 7})
 	require.NoError(t, err)
 	require.NotNil(t, first)
 	assert.True(t, strings.HasPrefix(first.Token, codespaceTokenPrefix))
 	assert.Len(t, first.Token, len(codespaceTokenPrefix)+64)
 	assert.NotEmpty(t, first.ServerURL)
 	assert.Equal(t, []RuntimeSecret{{Name: "RUNTIME_SECRET", Value: "runtime-value"}}, first.Secrets)
-	row := loadServiceGiteaToken(t, codespaceUUID)
+	row := loadServiceGiteaToken(t, codespaceID)
 	assert.Equal(t, first.Token[len(first.Token)-8:], row.TokenLastEight)
 	assert.True(t, verifyCodespaceGiteaToken(row, first.Token))
 
-	second, err := requestRuntimeCredentials(t.Context(), manager, requestRuntimeCredentialsOptions{CodespaceUUID: codespaceUUID, OperationRVersion: 7})
+	second, err := requestRuntimeCredentials(t.Context(), manager, requestRuntimeCredentialsOptions{CodespaceID: codespaceID, OperationRVersion: 7})
 	require.NoError(t, err)
 	assert.Equal(t, first.Token, second.Token)
-}
-
-func TestRuntimeCredentialsOmitsUnauthorizedSecrets(t *testing.T) {
-	require.NoError(t, unittest.PrepareTestDatabase())
-
-	tests := []struct {
-		name            string
-		codespaceUUID   string
-		userID          int64
-		repoID          int64
-		refType         string
-		refName         string
-		allRepositories bool
-	}{
-		{
-			name:          "code write access revoked",
-			codespaceUUID: "0a0a0a0a-0a0a-4a0a-8a0a-0a0a0a0a0a0a",
-			userID:        5,
-			repoID:        2,
-			refType:       "branch",
-			refName:       "master",
-		},
-		{
-			name:            "external pull request",
-			codespaceUUID:   "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b",
-			userID:          12,
-			repoID:          10,
-			refType:         "pull",
-			refName:         "refs/pull/1/head",
-			allRepositories: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			manager := insertServiceManager(t)
-			markServiceManagerOnline(t, manager, `[{"tag":"default"}]`)
-			insertServiceCodespace(t, manager.ID, &codespace_model.Codespace{
-				UUID:              tt.codespaceUUID,
-				Status:            codespace_model.StatusRunning,
-				OperationRVersion: 1,
-			})
-			_, err := db.GetEngine(t.Context()).Where("uuid = ?", tt.codespaceUUID).Cols("user_id", "repo_id", "ref_type", "ref_name").Update(&codespace_model.Codespace{
-				UserID: tt.userID, RepoID: tt.repoID, RefType: tt.refType, RefName: tt.refName,
-			})
-			require.NoError(t, err)
-
-			encrypted, err := secret_module.EncryptSecret(setting.SecretKey, "must-not-be-returned")
-			require.NoError(t, err)
-			secret := &codespace_model.UserSecret{
-				UserID: tt.userID, Name: "PRIVATE_VALUE", DataEncrypted: encrypted, DataSize: 20, AllRepositories: tt.allRepositories,
-			}
-			require.NoError(t, db.Insert(t.Context(), secret))
-			if !tt.allRepositories {
-				require.NoError(t, db.Insert(t.Context(), &codespace_model.UserSecretRepository{SecretID: secret.ID, RepoID: tt.repoID}))
-			}
-
-			result, err := requestRuntimeCredentials(t.Context(), manager, requestRuntimeCredentialsOptions{CodespaceUUID: tt.codespaceUUID, OperationRVersion: 1})
-			require.NoError(t, err)
-			assert.NotEmpty(t, result.Token)
-			assert.Empty(t, result.Secrets)
-		})
-	}
+	rowBeforeStop := loadServiceCodespace(t, codespaceID)
+	require.NoError(t, cleanupCredentialsForStatus(t.Context(), rowBeforeStop, codespace_model.StatusStopped))
+	_, err = db.GetEngine(t.Context()).ID(rowBeforeStop.ID).Cols("status", "operation_r_version").Update(&codespace_model.Codespace{Status: codespace_model.StatusStopped, OperationRVersion: 8})
+	require.NoError(t, err)
+	resumed, err := requestRuntimeCredentials(t.Context(), manager, requestRuntimeCredentialsOptions{CodespaceID: codespaceID, OperationRVersion: 8})
+	require.NoError(t, err)
+	assert.NotEqual(t, first.Token, resumed.Token)
+	assert.Equal(t, first.Secrets, resumed.Secrets)
 }
 
 func TestRuntimeCredentialsRepairsDamagedRow(t *testing.T) {
@@ -142,9 +88,9 @@ func TestRuntimeCredentialsRepairsDamagedRow(t *testing.T) {
 
 	manager := insertServiceManager(t)
 	markServiceManagerOnline(t, manager, `[{"tag":"default"}]`)
-	codespaceUUID := "ffffffff-ffff-4fff-8fff-ffffffffffff"
+	codespaceID := int64(1141)
 	insertServiceCodespace(t, manager.ID, &codespace_model.Codespace{
-		UUID:              codespaceUUID,
+		ID:                codespaceID,
 		Status:            codespace_model.StatusRunning,
 		OperationRVersion: 8,
 	})
@@ -152,20 +98,20 @@ func TestRuntimeCredentialsRepairsDamagedRow(t *testing.T) {
 	encrypted, err := secret_module.EncryptSecret(setting.SecretKey, badPlaintext)
 	require.NoError(t, err)
 	require.NoError(t, db.Insert(t.Context(), &codespace_model.GiteaToken{
-		CodespaceID:    loadServiceCodespace(t, codespaceUUID).ID,
+		CodespaceID:    loadServiceCodespace(t, codespaceID).ID,
 		TokenHash:      "wrong-hash",
 		TokenSalt:      "salt",
 		TokenLastEight: badPlaintext[len(badPlaintext)-8:],
 		TokenEncrypted: encrypted,
 	}))
 
-	result, err := requestRuntimeCredentials(t.Context(), manager, requestRuntimeCredentialsOptions{CodespaceUUID: codespaceUUID, OperationRVersion: 8})
+	result, err := requestRuntimeCredentials(t.Context(), manager, requestRuntimeCredentialsOptions{CodespaceID: codespaceID, OperationRVersion: 8})
 	require.NoError(t, err)
 	assert.NotEqual(t, badPlaintext, result.Token)
-	row := loadServiceGiteaToken(t, codespaceUUID)
+	row := loadServiceGiteaToken(t, codespaceID)
 	assert.True(t, verifyCodespaceGiteaToken(row, result.Token))
 
-	count, err := db.GetEngine(t.Context()).Where("codespace_id = (SELECT id FROM codespace WHERE uuid = ?)", codespaceUUID).Count(new(codespace_model.GiteaToken))
+	count, err := db.GetEngine(t.Context()).Where("codespace_id = ?", codespaceID).Count(new(codespace_model.GiteaToken))
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, count)
 }
@@ -175,9 +121,9 @@ func TestRuntimeCredentialsRejectsUnavailableState(t *testing.T) {
 
 	manager := insertServiceManager(t)
 	markServiceManagerOnline(t, manager, `[{"tag":"default"}]`)
-	codespaceUUID := "10101010-1010-4010-8010-101010101010"
+	codespaceID := int64(1014)
 	insertServiceCodespace(t, manager.ID, &codespace_model.Codespace{
-		UUID:                  codespaceUUID,
+		ID:                    codespaceID,
 		Status:                codespace_model.StatusRunning,
 		OperationRVersion:     9,
 		OperationTrigger:      codespace_model.OperationTriggerUser,
@@ -186,9 +132,9 @@ func TestRuntimeCredentialsRejectsUnavailableState(t *testing.T) {
 		OperationDeadlineUnix: time.Now().Add(time.Hour).Unix(),
 	})
 
-	_, err := requestRuntimeCredentials(t.Context(), manager, requestRuntimeCredentialsOptions{CodespaceUUID: codespaceUUID, OperationRVersion: 9})
+	_, err := requestRuntimeCredentials(t.Context(), manager, requestRuntimeCredentialsOptions{CodespaceID: codespaceID, OperationRVersion: 9})
 	require.ErrorIs(t, err, ErrRequestRuntimeAccessStateUnavailable)
-	assertServiceNotExists(t, new(codespace_model.GiteaToken), "codespace_id = (SELECT id FROM codespace WHERE uuid = ?)", codespaceUUID)
+	assertServiceNotExists(t, new(codespace_model.GiteaToken), "codespace_id = ?", codespaceID)
 }
 
 func TestRuntimeCredentialsRejectsDisabledCodespace(t *testing.T) {
@@ -196,16 +142,16 @@ func TestRuntimeCredentialsRejectsDisabledCodespace(t *testing.T) {
 	t.Cleanup(test.MockVariableValue(&setting.Codespace.Enabled, false))
 
 	manager := insertServiceManager(t)
-	codespaceUUID := "20202020-2020-4020-8020-202020202020"
+	codespaceID := int64(1025)
 	insertServiceCodespace(t, manager.ID, &codespace_model.Codespace{
-		UUID:              codespaceUUID,
+		ID:                codespaceID,
 		Status:            codespace_model.StatusRunning,
 		OperationRVersion: 10,
 	})
 
-	_, err := requestRuntimeCredentials(t.Context(), manager, requestRuntimeCredentialsOptions{CodespaceUUID: codespaceUUID, OperationRVersion: 10})
+	_, err := requestRuntimeCredentials(t.Context(), manager, requestRuntimeCredentialsOptions{CodespaceID: codespaceID, OperationRVersion: 10})
 	require.ErrorIs(t, err, ErrRequestRuntimeAccessStateUnavailable)
-	assertServiceNotExists(t, new(codespace_model.GiteaToken), "codespace_id = (SELECT id FROM codespace WHERE uuid = ?)", codespaceUUID)
+	assertServiceNotExists(t, new(codespace_model.GiteaToken), "codespace_id = ?", codespaceID)
 }
 
 func TestRuntimeCredentialsUsesCurrentManagerAvailability(t *testing.T) {
@@ -214,9 +160,9 @@ func TestRuntimeCredentialsUsesCurrentManagerAvailability(t *testing.T) {
 	manager := insertServiceManager(t)
 	markServiceManagerOnline(t, manager, `[{"tag":"default"}]`)
 	staleManager := *manager
-	codespaceUUID := "30303030-3030-4030-8030-303030303031"
+	codespaceID := int64(1142)
 	insertServiceCodespace(t, manager.ID, &codespace_model.Codespace{
-		UUID:              codespaceUUID,
+		ID:                codespaceID,
 		Status:            codespace_model.StatusRunning,
 		OperationRVersion: 10,
 	})
@@ -226,9 +172,9 @@ func TestRuntimeCredentialsUsesCurrentManagerAvailability(t *testing.T) {
 		Update(&codespace_model.Manager{LastOnlineUnix: 1})
 	require.NoError(t, err)
 
-	_, err = requestRuntimeCredentials(t.Context(), &staleManager, requestRuntimeCredentialsOptions{CodespaceUUID: codespaceUUID, OperationRVersion: 10})
+	_, err = requestRuntimeCredentials(t.Context(), &staleManager, requestRuntimeCredentialsOptions{CodespaceID: codespaceID, OperationRVersion: 10})
 	require.ErrorIs(t, err, ErrRequestRuntimeAccessManagerOffline)
-	assertServiceNotExists(t, new(codespace_model.GiteaToken), "codespace_id = (SELECT id FROM codespace WHERE uuid = ?)", codespaceUUID)
+	assertServiceNotExists(t, new(codespace_model.GiteaToken), "codespace_id = ?", codespaceID)
 
 	_, err = db.GetEngine(t.Context()).
 		ID(manager.ID).
@@ -238,7 +184,7 @@ func TestRuntimeCredentialsUsesCurrentManagerAvailability(t *testing.T) {
 			LastOnlineUnix: time.Now().Unix(),
 		})
 	require.NoError(t, err)
-	result, err := requestRuntimeCredentials(t.Context(), &staleManager, requestRuntimeCredentialsOptions{CodespaceUUID: codespaceUUID, OperationRVersion: 10})
+	result, err := requestRuntimeCredentials(t.Context(), &staleManager, requestRuntimeCredentialsOptions{CodespaceID: codespaceID, OperationRVersion: 10})
 	require.NoError(t, err)
 	assert.NotEmpty(t, result.Token)
 }
@@ -247,7 +193,7 @@ func TestResolveGiteaTokenRequiresTwoFactorWhenEnforced(t *testing.T) {
 	require.NoError(t, unittest.PrepareTestDatabase())
 	t.Cleanup(test.MockVariableValue(&setting.TwoFactorAuthEnforced, true))
 
-	token := createRunningServiceGiteaTokenForUser(t, "30303030-3030-4030-8030-303030303030", 1)
+	token := createRunningServiceGiteaTokenForUser(t, int64(1026), 1)
 
 	snapshot, err := ResolveGiteaToken(t.Context(), token)
 	require.ErrorIs(t, err, ErrResolveGiteaTokenForbidden)
@@ -259,30 +205,36 @@ func TestResolveGiteaTokenAcceptsTwoFactorOrWebAuthnWhenEnforced(t *testing.T) {
 	t.Cleanup(test.MockVariableValue(&setting.TwoFactorAuthEnforced, true))
 
 	tests := []struct {
-		name          string
-		codespaceUUID string
-		userID        int64
+		name        string
+		codespaceID int64
+		userID      int64
 	}{
 		{
-			name:          "totp",
-			codespaceUUID: "40404040-4040-4040-8040-404040404040",
-			userID:        24,
+			name:        "totp",
+			codespaceID: int64(1032),
+			userID:      24,
 		},
 		{
-			name:          "webauthn",
-			codespaceUUID: "50505050-5050-4050-8050-505050505050",
-			userID:        32,
+			name:        "webauthn",
+			codespaceID: int64(1143),
+			userID:      32,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			token := createRunningServiceGiteaTokenForUser(t, tt.codespaceUUID, tt.userID)
+			if tt.name == "webauthn" {
+				require.NoError(t, db.Insert(t.Context(), &auth_model.WebAuthnCredential{UserID: tt.userID, Name: "second credential"}))
+			}
+			token := createRunningServiceGiteaTokenForUser(t, tt.codespaceID, tt.userID)
+			candidates, err := findGiteaTokenAuthCandidates(t.Context(), token[len(token)-8:])
+			require.NoError(t, err)
+			require.Len(t, candidates, 1)
 
 			snapshot, err := ResolveGiteaToken(t.Context(), token)
 			require.NoError(t, err)
 			require.NotNil(t, snapshot)
 			assert.Equal(t, tt.userID, snapshot.User.ID)
-			assert.Equal(t, tt.codespaceUUID, snapshot.CodespaceUUID)
+			assert.Equal(t, tt.codespaceID, snapshot.CodespaceID)
 			assert.EqualValues(t, 2, snapshot.RepoID)
 		})
 	}
@@ -341,31 +293,31 @@ func TestLoadTokenRepositoryPermissions(t *testing.T) {
 	}
 }
 
-func createRunningServiceGiteaTokenForUser(t *testing.T, codespaceUUID string, userID int64) string {
+func createRunningServiceGiteaTokenForUser(t *testing.T, codespaceID, userID int64) string {
 	t.Helper()
 	manager := insertServiceManager(t)
 	markServiceManagerOnline(t, manager, `[{"tag":"default"}]`)
 	insertServiceCodespace(t, manager.ID, &codespace_model.Codespace{
-		UUID:              codespaceUUID,
+		ID:                codespaceID,
 		Status:            codespace_model.StatusRunning,
 		OperationRVersion: 11,
 	})
 	_, err := db.GetEngine(t.Context()).
-		Where("uuid = ?", codespaceUUID).
+		Where("id = ?", codespaceID).
 		Cols("user_id").
 		Update(&codespace_model.Codespace{UserID: userID})
 	require.NoError(t, err)
 
-	result, err := requestRuntimeCredentials(t.Context(), manager, requestRuntimeCredentialsOptions{CodespaceUUID: codespaceUUID, OperationRVersion: 11})
+	result, err := requestRuntimeCredentials(t.Context(), manager, requestRuntimeCredentialsOptions{CodespaceID: codespaceID, OperationRVersion: 11})
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	return result.Token
 }
 
-func loadServiceGiteaToken(t *testing.T, codespaceUUID string) *codespace_model.GiteaToken {
+func loadServiceGiteaToken(t *testing.T, codespaceID int64) *codespace_model.GiteaToken {
 	t.Helper()
 	row := new(codespace_model.GiteaToken)
-	has, err := db.GetEngine(t.Context()).ID(loadServiceCodespace(t, codespaceUUID).ID).Get(row)
+	has, err := db.GetEngine(t.Context()).ID(loadServiceCodespace(t, codespaceID).ID).Get(row)
 	require.NoError(t, err)
 	require.True(t, has)
 	return row

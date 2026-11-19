@@ -8,12 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
-	"net"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	codespacev1 "gitea.dev/codespace-proto-go/codespace/v1"
 	codespace_model "gitea.dev/models/codespace"
 	"gitea.dev/models/db"
 	repo_model "gitea.dev/models/repo"
@@ -55,6 +55,15 @@ const (
 	refreshStableMilliseconds     = 15000
 )
 
+var bootStageTranslationKeys = map[codespacev1.RuntimeBootStage]string{
+	codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_PREPARE_RUNTIME:   "codespace.boot_stage.prepare_runtime",
+	codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_INITIALIZE_SYSTEM: "codespace.boot_stage.initialize_system",
+	codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_PREPARE_WORKSPACE: "codespace.boot_stage.prepare_workspace",
+	codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_START_ENVIRONMENT: "codespace.boot_stage.start_environment",
+	codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_PUBLISH_READY:     "codespace.boot_stage.publish_ready",
+	codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_READY:             "codespace.boot_stage.ready",
+}
+
 // ErrViewNotFound is returned when the Codespace cannot be found.
 var ErrViewNotFound = errors.New("codespace view not found")
 
@@ -87,8 +96,6 @@ type CreatorCodespaceList struct {
 // CreatorCodespaceView contains the server-authoritative presentation state.
 type CreatorCodespaceView struct {
 	ID                   int64
-	UUID                 string
-	ShortUUID            string
 	RepoID               int64
 	RepoFullName         string
 	RepoLink             string
@@ -157,7 +164,6 @@ type CreatorEndpointView struct {
 // CreatorSSHView contains the current SSH command shown on the detail page.
 type CreatorSSHView struct {
 	Command            string
-	WorkspaceFolder    string
 	VSCodeURL          template.URL
 	ZedURL             template.URL
 	HostKeyAlgorithm   string
@@ -190,7 +196,7 @@ func ListCreatorCodespaces(ctx context.Context, opts CreatorListOptions) (*Creat
 	if opts.UserID <= 0 {
 		return nil, errors.New("user_id must be positive")
 	}
-	query := db.GetEngine(ctx).Table("codespace").Select("codespace.*").Where("codespace.user_id = ?", opts.UserID)
+	query := db.GetEngine(ctx).Table("codespace").Select(codespaceStateColumns).Where("codespace.user_id = ?", opts.UserID)
 	if opts.RepoID > 0 {
 		query.And("codespace.repo_id = ?", opts.RepoID)
 	}
@@ -283,7 +289,7 @@ func GetCreatorCodespace(ctx context.Context, opts CreatorDetailOptions) (*Creat
 
 func findCreatorCodespace(ctx context.Context, userID, codespaceID int64) (*codespace_model.Codespace, bool, error) {
 	codespace := new(codespace_model.Codespace)
-	has, err := db.GetEngine(ctx).ID(codespaceID).Where("user_id = ?", userID).Get(codespace)
+	has, err := db.GetEngine(ctx).ID(codespaceID).Where("user_id = ?", userID).Omit("secrets_encrypted").Get(codespace)
 	return codespace, has, err
 }
 
@@ -296,8 +302,6 @@ func creatorCodespaceView(codespace *codespace_model.Codespace, cache *codespace
 	}
 	view := &CreatorCodespaceView{
 		ID:                codespace.ID,
-		UUID:              codespace.UUID,
-		ShortUUID:         shortCodespaceUUID(codespace.UUID),
 		RepoID:            codespace.RepoID,
 		RefType:           codespace.RefType,
 		RefName:           codespace.RefName,
@@ -328,12 +332,9 @@ func creatorCodespaceView(codespace *codespace_model.Codespace, cache *codespace
 		view.DetailMode = DetailModeLogs
 	}
 	if includeDetailData && (view.DisplayStatus == DisplayBooting || view.DisplayStatus == DisplayResuming) {
-		entry, hasEntry, err := getRuntimeMetadataEntry(codespace.UUID)
+		entry, hasEntry, err := getRuntimeMetadataEntry(codespace.ID)
 		if err == nil && hasEntry && entry.Metadata.Boot.OperationRVersion == codespace.OperationRVersion {
-			switch entry.Metadata.Boot.Stage {
-			case bootStagePrepareRuntime, bootStageInitializeSystem, bootStagePrepareWorkspace, bootStageStartEnvironment, bootStagePublishReady, bootStageReady:
-				view.BootStageKey = "codespace.boot_stage." + strings.ReplaceAll(entry.Metadata.Boot.Stage, "-", "_")
-			}
+			view.BootStageKey = bootStageTranslationKeys[entry.Metadata.Boot.Stage]
 		}
 	}
 	applyCreatorActions(codespace, view, manager)
@@ -417,6 +418,7 @@ func creatorDurationView(seconds int64) CreatorDurationView {
 }
 
 func applyCreatorDisplayState(codespace *codespace_model.Codespace, view *CreatorCodespaceView, manager *codespace_model.Manager, includeDetailData bool) {
+	managerReady := manager != nil && manager.RuntimeState == codespace_model.ManagerRuntimeStateOnline && !isManagerOffline(manager)
 	view.DisplayStatus = codespace.Status
 	switch codespace.Status {
 	case codespace_model.StatusCreating:
@@ -426,7 +428,16 @@ func applyCreatorDisplayState(codespace *codespace_model.Codespace, view *Creato
 			view.DisplayStatus = DisplayBooting
 		}
 	case codespace_model.StatusRunning:
-		view.DisplayStatus = runningDisplayStatus(codespace, view, manager, includeDetailData)
+		switch {
+		case codespace_model.ActiveOperationType(codespace) == codespace_model.OperationStop && !isQueuedIdleStop(codespace):
+			view.DisplayStatus = DisplayStopping
+		case !managerReady:
+			view.DisplayStatus = DisplayRecovering
+		case !applyRuntimeAccessView(codespace, view, manager, includeDetailData):
+			view.DisplayStatus = DisplayMetadataRebuilding
+		default:
+			view.DisplayStatus = DisplayRunning
+		}
 	case codespace_model.StatusStopped:
 		if codespace_model.ActiveOperationType(codespace) == codespace_model.OperationResume {
 			view.DisplayStatus = DisplayResuming
@@ -436,6 +447,9 @@ func applyCreatorDisplayState(codespace *codespace_model.Codespace, view *Creato
 	case codespace_model.StatusFailed:
 		view.DisplayStatus = DisplayFailed
 	}
+	if managerReady && hasActiveStartup(codespace, time.Now().Unix()) {
+		applyRuntimeAccessView(codespace, view, manager, includeDetailData)
+	}
 	view.RefreshAfterMillis = refreshStableMilliseconds
 	switch view.DisplayStatus {
 	case DisplayQueued, DisplayBooting, DisplayStopping, DisplayResuming, DisplayDeleting, DisplayMetadataRebuilding, DisplayRecovering:
@@ -443,27 +457,20 @@ func applyCreatorDisplayState(codespace *codespace_model.Codespace, view *Creato
 	}
 	view.DisplayStatusKey = "codespace.status." + view.DisplayStatus
 	view.StatusSummaryKey = "codespace.status_summary." + view.DisplayStatus
-	if view.DisplayStatus == DisplayStopped && (manager == nil || manager.RuntimeState != codespace_model.ManagerRuntimeStateOnline || isManagerOffline(manager)) {
+	if view.DisplayStatus == DisplayStopped && !managerReady {
 		view.StatusSummaryKey = "codespace.stopped_manager_unavailable"
 	}
 }
 
-func runningDisplayStatus(codespace *codespace_model.Codespace, view *CreatorCodespaceView, manager *codespace_model.Manager, includeDetailData bool) string {
-	if codespace_model.ActiveOperationType(codespace) == codespace_model.OperationStop && !isQueuedIdleStop(codespace) {
-		return DisplayStopping
-	}
-	if manager == nil || manager.RuntimeState != codespace_model.ManagerRuntimeStateOnline || isManagerOffline(manager) {
-		return DisplayRecovering
-	}
-	entry, hasEntry, err := getRuntimeMetadataEntry(codespace.UUID)
-	if err != nil || !hasEntry || !runtimeMetadataReadyForRunning(codespace, entry.Metadata) {
-		return DisplayMetadataRebuilding
+func applyRuntimeAccessView(codespace *codespace_model.Codespace, view *CreatorCodespaceView, manager *codespace_model.Manager, includeDetailData bool) bool {
+	entry, hasEntry, err := getRuntimeMetadataEntry(codespace.ID)
+	if err != nil || !hasEntry || !runtimeMetadataReadyForAccess(codespace, entry.Metadata) {
+		return false
 	}
 	for _, endpoint := range entry.Metadata.Endpoints {
 		if endpoint.EndpointID == workspaceEndpointID {
 			view.Workspace = &CreatorEndpointView{
 				EndpointID: workspaceEndpointID,
-				Label:      workspaceEndpointLabel,
 				OpenPath:   codespaceDetailPath(codespace.ID) + "/open",
 			}
 			continue
@@ -471,56 +478,49 @@ func runningDisplayStatus(codespace *codespace_model.Codespace, view *CreatorCod
 		if !includeDetailData {
 			continue
 		}
-		endpointURL, _ := gatewayEndpointURL(manager.GatewayURL, codespace.UUID, endpoint.EndpointID)
 		view.Endpoints = append(view.Endpoints, CreatorEndpointView{
 			EndpointID: endpoint.EndpointID,
 			Label:      endpoint.Label,
 			Port:       uint16(endpoint.Port),
 			Public:     endpoint.Public,
-			URL:        endpointURL,
+			URL:        endpoint.URL,
 			OpenPath:   codespaceDetailPath(codespace.ID) + "/open/" + endpoint.EndpointID,
 		})
 	}
 	if includeDetailData {
 		view.ResourceUsage = creatorResourceUsageView(entry.Metadata.ResourceUsage)
-		view.SSH = creatorSSHView(codespace, manager, entry.Metadata.WorkspaceFolder)
+		view.SSH = creatorSSHView(manager, entry.Metadata)
 	}
-	return DisplayRunning
+	return true
 }
 
-func creatorSSHView(codespace *codespace_model.Codespace, manager *codespace_model.Manager, workspaceFolder string) *CreatorSSHView {
-	if manager.GatewaySSHAddr == "" {
-		return nil
-	}
-	host, port, err := net.SplitHostPort(manager.GatewaySSHAddr)
+func creatorSSHView(manager *codespace_model.Manager, metadata runtimeMetadata) *CreatorSSHView {
+	ssh, err := parseRuntimeSSHURI(metadata.SSH)
 	if err != nil {
 		return nil
 	}
-	remoteHost := host
-	if strings.Contains(host, ":") {
-		remoteHost = "[" + host + "]"
+	remoteHost := ssh.Hostname()
+	if strings.Contains(remoteHost, ":") {
+		remoteHost = "[" + remoteHost + "]"
 	}
-	remote := "cs-" + codespace.UUID + "@" + remoteHost
-	command := "ssh cs-" + codespace.UUID + "@" + remoteHost
-	if port != "" && port != "22" {
-		remote = "cs-" + codespace.UUID + "@" + net.JoinHostPort(host, port)
-		command = "ssh -p " + port + " cs-" + codespace.UUID + "@" + remoteHost
+	user := ssh.User.Username()
+	command := "ssh " + user + "@" + remoteHost
+	if ssh.Port() != "22" {
+		command = fmt.Sprintf("ssh -p %s %s@%s", ssh.Port(), user, remoteHost)
+		remoteHost = ssh.Host
 	}
-	workspacePath := strings.TrimPrefix(workspaceFolder, "/")
-	vsCodeURL := (&url.URL{Scheme: "vscode", Host: "vscode-remote", Path: "/ssh-remote+" + remote + "/" + workspacePath}).String()
-	zedURL := (&url.URL{Scheme: "zed", Host: "ssh", Path: "/" + remote + "/" + workspacePath}).String()
+	remote := user + "@" + remoteHost
 	return &CreatorSSHView{
 		Command:            command,
-		WorkspaceFolder:    workspaceFolder,
-		VSCodeURL:          template.URL(vsCodeURL),
-		ZedURL:             template.URL(zedURL),
+		VSCodeURL:          template.URL((&url.URL{Scheme: "vscode", Host: "vscode-remote", Path: "/ssh-remote+" + remote + metadata.WorkspaceFolder}).String()),
+		ZedURL:             template.URL((&url.URL{Scheme: "zed", Host: "ssh", Path: "/" + remote + metadata.WorkspaceFolder}).String()),
 		HostKeyAlgorithm:   strings.TrimSpace(manager.GatewaySSHHostKeyAlgorithm),
 		HostKeyFingerprint: strings.TrimSpace(manager.GatewaySSHHostKeyFingerprintSHA256),
 	}
 }
 
 func creatorResourceUsageView(usage runtimeMetadataResourceUsage) *CreatorResourceUsageView {
-	if usage.ObservedUnix <= 0 || time.Now().Unix()-usage.ObservedUnix >= int64(setting.Codespace.ManagerOfflineTimeout*2/time.Second) {
+	if usage.ObservedUnix <= 0 || time.Now().Unix()-usage.ObservedUnix >= int64(runtimeMetadataMaxAge/time.Second) {
 		return nil
 	}
 	return &CreatorResourceUsageView{
@@ -562,12 +562,10 @@ func formatBytes(value int64) string {
 func applyCreatorActions(codespace *codespace_model.Codespace, view *CreatorCodespaceView, manager *codespace_model.Manager) {
 	view.CanDelete = codespace.Status != codespace_model.StatusDeleting
 	view.CanConfigureAutoStop = codespace.Status == codespace_model.StatusRunning || codespace.Status == codespace_model.StatusStopped
-	view.CanOpen = view.DisplayStatus == DisplayRunning && view.Workspace != nil && (!hasActiveOperation(codespace) || isQueuedIdleStop(codespace))
-	if view.Workspace != nil {
-		view.Workspace.CanOpen = view.CanOpen
-	}
+	startup := hasActiveStartup(codespace, time.Now().Unix())
+	view.CanOpen = view.Workspace != nil && (startup || (view.DisplayStatus == DisplayRunning && (!hasActiveOperation(codespace) || isQueuedIdleStop(codespace))))
 	for i := range view.Endpoints {
-		view.Endpoints[i].CanOpen = view.DisplayStatus == DisplayRunning && (!hasActiveOperation(codespace) || (!view.Endpoints[i].Public && isQueuedIdleStop(codespace)))
+		view.Endpoints[i].CanOpen = startup || (view.DisplayStatus == DisplayRunning && (!hasActiveOperation(codespace) || (!view.Endpoints[i].Public && isQueuedIdleStop(codespace))))
 	}
 	view.CanContinue = codespace.Status == codespace_model.StatusRunning && isQueuedIdleStop(codespace)
 	view.CanStop = codespace.Status == codespace_model.StatusRunning && (!hasActiveOperation(codespace) || isQueuedIdleStop(codespace))

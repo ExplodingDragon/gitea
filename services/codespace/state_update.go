@@ -13,9 +13,16 @@ import (
 
 var errCodespaceStateChanged = errors.New("codespace state changed")
 
+const codespaceStateColumns = "codespace.id, codespace.user_id, codespace.repo_id, " +
+	"codespace.ref_type, codespace.ref_name, codespace.environment_tag, codespace.commit_sha, " +
+	"codespace.permission_authorization_id, codespace.manager_id, codespace.status, " +
+	"codespace.operation_r_version, codespace.runtime_operation_r_version, codespace.operation_trigger, " +
+	"codespace.operation_created_unix, codespace.operation_started_unix, codespace.operation_deadline_unix, " +
+	"codespace.last_active_unix, codespace.auto_stop_mode, codespace.auto_stop_timeout_seconds, " +
+	"codespace.interaction_generation, codespace.created_unix, codespace.updated_unix, codespace.log_size"
+
 type codespaceStateSnapshot struct {
 	id                       int64
-	uuid                     string
 	managerID                int64
 	status                   string
 	operationRVersion        int64
@@ -30,7 +37,6 @@ type codespaceStateSnapshot struct {
 func snapshotCodespaceState(codespace *codespace_model.Codespace) codespaceStateSnapshot {
 	return codespaceStateSnapshot{
 		id:                       codespace.ID,
-		uuid:                     codespace.UUID,
 		managerID:                codespace.ManagerID,
 		status:                   codespace.Status,
 		operationRVersion:        codespace.OperationRVersion,
@@ -59,11 +65,6 @@ func updateCodespaceState(ctx context.Context, expected codespaceStateSnapshot, 
 	)
 	if matchInteraction {
 		query = query.And("interaction_generation = ?", expected.interactionGeneration)
-	}
-	if expected.uuid == "" {
-		query = query.And("uuid IS NULL")
-	} else {
-		query = query.And("uuid = ?", expected.uuid)
 	}
 	affected, err := query.Cols(columns...).Update(codespace)
 	if err != nil {

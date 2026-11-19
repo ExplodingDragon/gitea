@@ -10,9 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
+	"net/url"
 	"path"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -30,18 +33,12 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const (
-	workspaceEndpointID       = "workspace"
-	workspaceEndpointLabel    = "Workspace"
-	bootStagePrepareRuntime   = "prepare-runtime"
-	bootStageInitializeSystem = "initialize-system"
-	bootStagePrepareWorkspace = "prepare-workspace"
-	bootStageStartEnvironment = "start-environment"
-	bootStagePublishReady     = "publish-ready"
-	bootStageReady            = "ready"
-)
+const workspaceEndpointID = "workspace"
 
-var endpointIDPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?$`)
+var (
+	endpointIDPattern     = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?$`)
+	runtimeSSHUserPattern = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$`)
+)
 
 var (
 	// ErrRuntimeMetadataManagerMismatch is returned when the Codespace is bound to another Manager.
@@ -69,7 +66,7 @@ func (e *StaleGenerationError) Error() string {
 
 // ReportRuntimeMetadataOptions contains a Manager metadata report after RPC validation.
 type ReportRuntimeMetadataOptions struct {
-	CodespaceUUID      string
+	CodespaceID        int64
 	Metadata           *codespacev1.RuntimeMetadata
 	MetadataGeneration int64
 }
@@ -85,6 +82,7 @@ type runtimeMetadata struct {
 	Boot            runtimeMetadataBoot          `json:"boot"`
 	ResourceUsage   runtimeMetadataResourceUsage `json:"resource_usage"`
 	WorkspaceFolder string                       `json:"workspace_folder"`
+	SSH             string                       `json:"ssh"`
 }
 
 type runtimeMetadataEndpoint struct {
@@ -92,6 +90,7 @@ type runtimeMetadataEndpoint struct {
 	Label      string `json:"label"`
 	Public     bool   `json:"public"`
 	Port       uint32 `json:"port,omitempty"`
+	URL        string `json:"url"`
 }
 
 func (m runtimeMetadata) endpointByID(endpointID string) (runtimeMetadataEndpoint, bool) {
@@ -103,23 +102,28 @@ func (m runtimeMetadata) endpointByID(endpointID string) (runtimeMetadataEndpoin
 	return runtimeMetadataEndpoint{}, false
 }
 
-func runtimeMetadataReadyForRunning(codespace *codespace_model.Codespace, metadata runtimeMetadata) bool {
-	return metadata.Boot.Stage == bootStageReady &&
-		metadata.Boot.OperationRVersion == codespace.RuntimeOperationRVersion
+func runtimeMetadataReadyForAccess(codespace *codespace_model.Codespace, metadata runtimeMetadata) bool {
+	if metadata.Boot.Stage != codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_READY {
+		return false
+	}
+	if hasActiveStartup(codespace, time.Now().Unix()) {
+		return metadata.Boot.OperationRVersion == codespace.OperationRVersion
+	}
+	return codespace.Status == codespace_model.StatusRunning && (!hasActiveOperation(codespace) || isQueuedIdleStop(codespace)) && metadata.Boot.OperationRVersion == codespace.RuntimeOperationRVersion
 }
 
 type runtimeMetadataBoot struct {
-	OperationRVersion int64  `json:"operation_rversion"`
-	Stage             string `json:"stage"`
-	StartedUnix       int64  `json:"started_unix"`
-	LastUpdateUnix    int64  `json:"last_update_unix"`
+	OperationRVersion int64                        `json:"operation_rversion"`
+	Stage             codespacev1.RuntimeBootStage `json:"stage"`
+	StartedUnix       int64                        `json:"started_unix"`
+	LastUpdateUnix    int64                        `json:"last_update_unix"`
 }
 
 type runtimeMetadataResourceUsage struct {
-	CPU          runtimeMetadataCPUUsage    `json:"cpu"`
-	Memory       runtimeMetadataMemoryUsage `json:"memory"`
-	Disk         runtimeMetadataDiskUsage   `json:"disk"`
-	ObservedUnix int64                      `json:"observed_unix"`
+	CPU          runtimeMetadataCPUUsage   `json:"cpu"`
+	Memory       runtimeMetadataBytesUsage `json:"memory"`
+	Disk         runtimeMetadataBytesUsage `json:"disk"`
+	ObservedUnix int64                     `json:"observed_unix"`
 }
 
 type runtimeMetadataCPUUsage struct {
@@ -127,12 +131,7 @@ type runtimeMetadataCPUUsage struct {
 	LimitMillicores int64 `json:"limit_millicores"`
 }
 
-type runtimeMetadataMemoryUsage struct {
-	UsedBytes  int64 `json:"used_bytes"`
-	LimitBytes int64 `json:"limit_bytes"`
-}
-
-type runtimeMetadataDiskUsage struct {
+type runtimeMetadataBytesUsage struct {
 	UsedBytes  int64 `json:"used_bytes"`
 	LimitBytes int64 `json:"limit_bytes"`
 }
@@ -145,8 +144,8 @@ func ReportRuntimeMetadata(ctx context.Context, manager *codespace_model.Manager
 	if manager == nil || manager.ID <= 0 {
 		return errors.New("manager is required")
 	}
-	if err := codespace_model.ValidateUUID(opts.CodespaceUUID); err != nil {
-		return util.NewInvalidArgumentErrorf("%v", err)
+	if opts.CodespaceID <= 0 {
+		return util.NewInvalidArgumentErrorf("codespace_id must be positive")
 	}
 	if opts.MetadataGeneration <= 0 {
 		return util.NewInvalidArgumentErrorf("metadata_generation must be positive")
@@ -162,8 +161,11 @@ func ReportRuntimeMetadata(ctx context.Context, manager *codespace_model.Manager
 	if err != nil {
 		return util.NewInvalidArgumentErrorf("%v", err)
 	}
+	if err := validateRuntimeAddresses(metadata, manager); err != nil {
+		return util.NewInvalidArgumentErrorf("%v", err)
+	}
 
-	return globallock.LockAndDo(ctx, runtimeMetadataLockKey(opts.CodespaceUUID), func(ctx context.Context) error {
+	return globallock.LockAndDo(ctx, runtimeMetadataLockKey(opts.CodespaceID), func(ctx context.Context) error {
 		allowed, err = currentManagerAllowsOnlineOrRecovering(ctx, manager.ID)
 		if err != nil {
 			return err
@@ -172,7 +174,7 @@ func ReportRuntimeMetadata(ctx context.Context, manager *codespace_model.Manager
 			return ErrRuntimeMetadataManagerOffline
 		}
 		codespace := new(codespace_model.Codespace)
-		has, err := db.GetEngine(ctx).Where("uuid = ?", opts.CodespaceUUID).Get(codespace)
+		has, err := db.GetEngine(ctx).ID(opts.CodespaceID).Select(codespaceStateColumns).Get(codespace)
 		if err != nil {
 			return err
 		}
@@ -186,7 +188,7 @@ func ReportRuntimeMetadata(ctx context.Context, manager *codespace_model.Manager
 			return err
 		}
 
-		current, hasCurrent, err := getRuntimeMetadataEntry(opts.CodespaceUUID)
+		current, hasCurrent, err := getRuntimeMetadataEntry(opts.CodespaceID)
 		if err != nil {
 			return err
 		}
@@ -200,15 +202,17 @@ func ReportRuntimeMetadata(ctx context.Context, manager *codespace_model.Manager
 			if opts.MetadataGeneration == current.Generation && contentHash != current.ContentHash {
 				return ErrRuntimeMetadataGenerationConflict
 			}
-			if err := validateRuntimeMetadataStageForward(current.Metadata, metadata); err != nil {
-				return err
-			}
-			if metadata.Boot.OperationRVersion == current.Metadata.Boot.OperationRVersion && metadata.ResourceUsage.ObservedUnix <= current.Metadata.ResourceUsage.ObservedUnix {
-				metadata.ResourceUsage = current.Metadata.ResourceUsage
+			if metadata.Boot.OperationRVersion == current.Metadata.Boot.OperationRVersion {
+				if metadata.Boot.Stage < current.Metadata.Boot.Stage {
+					return ErrRuntimeMetadataStaleOperation
+				}
+				if metadata.ResourceUsage.ObservedUnix <= current.Metadata.ResourceUsage.ObservedUnix {
+					metadata.ResourceUsage = current.Metadata.ResourceUsage
+				}
 			}
 		}
 
-		return putRuntimeMetadataEntry(opts.CodespaceUUID, runtimeMetadataCacheEntry{
+		return putRuntimeMetadataEntry(opts.CodespaceID, runtimeMetadataCacheEntry{
 			Metadata:    metadata,
 			Generation:  opts.MetadataGeneration,
 			ContentHash: contentHash,
@@ -216,11 +220,11 @@ func ReportRuntimeMetadata(ctx context.Context, manager *codespace_model.Manager
 	})
 }
 
-func deleteRuntimeMetadata(codespaceUUID string) {
+func deleteRuntimeMetadata(codespaceID int64) {
 	if cache.GetCache() == nil {
 		return
 	}
-	_ = cache.GetCache().Delete(runtimeMetadataCacheKey(codespaceUUID))
+	_ = cache.GetCache().Delete(runtimeMetadataCacheKey(codespaceID))
 }
 
 func normalizeRuntimeMetadata(input *codespacev1.RuntimeMetadata) (runtimeMetadata, string, error) {
@@ -237,17 +241,14 @@ func normalizeRuntimeMetadata(input *codespacev1.RuntimeMetadata) (runtimeMetada
 	if err != nil {
 		return runtimeMetadata{}, "", err
 	}
-	bootStage, ok := runtimeMetadataBootStage(input.GetBoot().GetStage())
-	if !ok {
-		return runtimeMetadata{}, "", fmt.Errorf("invalid boot stage %q", input.GetBoot().GetStage())
-	}
+	bootStage := input.GetBoot().GetStage()
 
 	workspaceFolder := input.GetWorkspaceFolder()
 	if workspaceFolder != "" {
 		if len(workspaceFolder) > 4096 || !utf8.ValidString(workspaceFolder) || strings.TrimSpace(workspaceFolder) != workspaceFolder || !path.IsAbs(workspaceFolder) || path.Clean(workspaceFolder) != workspaceFolder || strings.ContainsFunc(workspaceFolder, unicode.IsControl) {
 			return runtimeMetadata{}, "", errors.New("runtime metadata workspace folder must be a clean absolute POSIX path")
 		}
-	} else if bootStage == bootStagePublishReady || bootStage == bootStageReady {
+	} else if bootStage == codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_PUBLISH_READY || bootStage == codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_READY {
 		return runtimeMetadata{}, "", errors.New("runtime metadata workspace folder is required when publishing ready state")
 	}
 
@@ -261,6 +262,7 @@ func normalizeRuntimeMetadata(input *codespacev1.RuntimeMetadata) (runtimeMetada
 		},
 		ResourceUsage:   resourceUsage,
 		WorkspaceFolder: workspaceFolder,
+		SSH:             input.GetSsh(),
 	}
 	if err := validateRuntimeMetadataBoot(metadata.Boot); err != nil {
 		return runtimeMetadata{}, "", err
@@ -305,22 +307,35 @@ func normalizeRuntimeMetadataEndpoint(endpoint *codespacev1.RuntimeEndpoint) (ru
 	if !endpointIDPattern.MatchString(endpoint.GetEndpointId()) {
 		return runtimeMetadataEndpoint{}, fmt.Errorf("invalid endpoint_id %q", endpoint.GetEndpointId())
 	}
-	label, err := normalizeRuntimeMetadataLabel(endpoint.GetLabel())
-	if err != nil {
-		return runtimeMetadataEndpoint{}, err
-	}
 	normalized := runtimeMetadataEndpoint{
 		EndpointID: endpoint.GetEndpointId(),
-		Label:      label,
 		Public:     endpoint.GetPublic(),
 		Port:       endpoint.GetPort(),
+		URL:        endpoint.GetUrl(),
 	}
 	if normalized.Port > 65535 {
 		return runtimeMetadataEndpoint{}, fmt.Errorf("invalid endpoint port %d", normalized.Port)
 	}
-	if normalized.EndpointID == workspaceEndpointID && (normalized.Label != workspaceEndpointLabel || normalized.Public || normalized.Port != 0) {
-		return runtimeMetadataEndpoint{}, errors.New("runtime metadata workspace endpoint is invalid")
+	if normalized.EndpointID == workspaceEndpointID {
+		if normalized.Public || normalized.Port != 0 {
+			return runtimeMetadataEndpoint{}, errors.New("runtime metadata workspace endpoint is invalid")
+		}
+		return normalized, nil
 	}
+	label := endpoint.GetLabel()
+	if !utf8.ValidString(label) {
+		return runtimeMetadataEndpoint{}, errors.New("endpoint label must be valid UTF-8")
+	}
+	label = strings.TrimSpace(label)
+	if count := utf8.RuneCountInString(label); count < 1 || count > 64 {
+		return runtimeMetadataEndpoint{}, errors.New("endpoint label must be 1 to 64 characters")
+	}
+	for _, r := range label {
+		if unicode.IsControl(r) || r == '<' || r == '>' {
+			return runtimeMetadataEndpoint{}, errors.New("endpoint label contains invalid character")
+		}
+	}
+	normalized.Label = label
 	return normalized, nil
 }
 
@@ -342,11 +357,11 @@ func normalizeRuntimeMetadataResourceUsage(input *codespacev1.RuntimeResourceUsa
 			UsedMillicores:  input.GetCpu().GetUsedMillicores(),
 			LimitMillicores: input.GetCpu().GetLimitMillicores(),
 		},
-		Memory: runtimeMetadataMemoryUsage{
+		Memory: runtimeMetadataBytesUsage{
 			UsedBytes:  input.GetMemory().GetUsedBytes(),
 			LimitBytes: input.GetMemory().GetLimitBytes(),
 		},
-		Disk: runtimeMetadataDiskUsage{
+		Disk: runtimeMetadataBytesUsage{
 			UsedBytes:  input.GetDisk().GetUsedBytes(),
 			LimitBytes: input.GetDisk().GetLimitBytes(),
 		},
@@ -367,47 +382,11 @@ func normalizeRuntimeMetadataResourceUsage(input *codespacev1.RuntimeResourceUsa
 	return usage, nil
 }
 
-func runtimeMetadataBootStage(stage codespacev1.RuntimeBootStage) (string, bool) {
-	switch stage {
-	case codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_PREPARE_RUNTIME:
-		return bootStagePrepareRuntime, true
-	case codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_INITIALIZE_SYSTEM:
-		return bootStageInitializeSystem, true
-	case codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_PREPARE_WORKSPACE:
-		return bootStagePrepareWorkspace, true
-	case codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_START_ENVIRONMENT:
-		return bootStageStartEnvironment, true
-	case codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_PUBLISH_READY:
-		return bootStagePublishReady, true
-	case codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_READY:
-		return bootStageReady, true
-	default:
-		return "", false
-	}
-}
-
-func normalizeRuntimeMetadataLabel(label string) (string, error) {
-	if !utf8.ValidString(label) {
-		return "", errors.New("endpoint label must be valid UTF-8")
-	}
-	label = strings.TrimSpace(label)
-	count := utf8.RuneCountInString(label)
-	if count < 1 || count > 64 {
-		return "", errors.New("endpoint label must be 1 to 64 characters")
-	}
-	for _, r := range label {
-		if unicode.IsControl(r) || r == '<' || r == '>' {
-			return "", errors.New("endpoint label contains invalid character")
-		}
-	}
-	return label, nil
-}
-
 func validateRuntimeMetadataBoot(boot runtimeMetadataBoot) error {
 	if boot.OperationRVersion <= 0 {
 		return errors.New("boot operation_rversion must be positive")
 	}
-	if bootStageRank(boot.Stage) < 0 {
+	if _, ok := codespacev1.RuntimeBootStage_name[int32(boot.Stage)]; !ok || boot.Stage == codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_UNSPECIFIED {
 		return fmt.Errorf("invalid boot stage %q", boot.Stage)
 	}
 	if boot.StartedUnix <= 0 {
@@ -430,20 +409,10 @@ func validateRuntimeMetadataState(codespace *codespace_model.Codespace, metadata
 			return ErrRuntimeMetadataStaleOperation
 		}
 	case codespace_model.StatusRunning:
-		if metadata.Boot.Stage != bootStageReady || metadata.Boot.OperationRVersion != codespace.RuntimeOperationRVersion {
+		if metadata.Boot.Stage != codespacev1.RuntimeBootStage_RUNTIME_BOOT_STAGE_READY || metadata.Boot.OperationRVersion != codespace.RuntimeOperationRVersion {
 			return ErrRuntimeMetadataStaleOperation
 		}
 	default:
-		return ErrRuntimeMetadataStaleOperation
-	}
-	return nil
-}
-
-func validateRuntimeMetadataStageForward(current, next runtimeMetadata) error {
-	if current.Boot.OperationRVersion != next.Boot.OperationRVersion {
-		return nil
-	}
-	if bootStageRank(next.Boot.Stage) < bootStageRank(current.Boot.Stage) {
 		return ErrRuntimeMetadataStaleOperation
 	}
 	return nil
@@ -455,62 +424,81 @@ func currentOperationMatches(codespace *codespace_model.Codespace, operationType
 		codespace_model.IsOperationRunning(codespace)
 }
 
-func createOrResumeOperationActive(codespace *codespace_model.Codespace, now int64) bool {
-	switch codespace.Status {
-	case codespace_model.StatusCreating:
-		return currentOperationMatches(codespace, codespace_model.OperationCreate, codespace.OperationRVersion) &&
-			codespace.OperationDeadlineUnix > now
-	case codespace_model.StatusStopped:
-		return currentOperationMatches(codespace, codespace_model.OperationResume, codespace.OperationRVersion) &&
-			codespace.OperationDeadlineUnix > now
-	default:
-		return false
-	}
-}
-
-func bootStageRank(stage string) int {
-	switch stage {
-	case bootStagePrepareRuntime:
-		return 0
-	case bootStageInitializeSystem:
-		return 1
-	case bootStagePrepareWorkspace:
-		return 2
-	case bootStageStartEnvironment:
-		return 3
-	case bootStagePublishReady:
-		return 4
-	case bootStageReady:
-		return 5
-	default:
-		return -1
-	}
-}
-
-func getRuntimeMetadataEntry(codespaceUUID string) (runtimeMetadataCacheEntry, bool, error) {
+func getRuntimeMetadataEntry(codespaceID int64) (runtimeMetadataCacheEntry, bool, error) {
 	if cache.GetCache() == nil {
 		return runtimeMetadataCacheEntry{}, false, errors.New("cache is not initialized")
 	}
 	entry := runtimeMetadataCacheEntry{}
-	exists, getErr := cache.GetCache().GetJSON(runtimeMetadataCacheKey(codespaceUUID), &entry)
+	exists, getErr := cache.GetCache().GetJSON(runtimeMetadataCacheKey(codespaceID), &entry)
 	if getErr != nil {
 		return runtimeMetadataCacheEntry{}, false, getErr.ToError()
 	}
 	return entry, exists, nil
 }
 
-func putRuntimeMetadataEntry(codespaceUUID string, entry runtimeMetadataCacheEntry) error {
+func putRuntimeMetadataEntry(codespaceID int64, entry runtimeMetadataCacheEntry) error {
 	if cache.GetCache() == nil {
 		return errors.New("cache is not initialized")
 	}
 	// Retain metadata beyond one offline window so transient missed reports do not immediately remove usable endpoint state.
-	return cache.GetCache().PutJSON(runtimeMetadataCacheKey(codespaceUUID), entry, int64((setting.Codespace.ManagerOfflineTimeout*2)/time.Second))
+	return cache.GetCache().PutJSON(runtimeMetadataCacheKey(codespaceID), entry, int64(runtimeMetadataMaxAge/time.Second))
 }
 
-func runtimeMetadataCacheKey(codespaceUUID string) string {
-	return "codespace:runtime-meta:" + codespaceUUID
+func runtimeMetadataCacheKey(codespaceID int64) string {
+	return "codespace:runtime-meta:" + strconv.FormatInt(codespaceID, 10)
 }
 
-func runtimeMetadataLockKey(codespaceUUID string) string {
-	return "codespace_runtime_metadata_" + codespaceUUID
+func runtimeMetadataLockKey(codespaceID int64) string {
+	return "codespace_runtime_metadata_" + strconv.FormatInt(codespaceID, 10)
+}
+
+func validateRuntimeAddresses(metadata runtimeMetadata, manager *codespace_model.Manager) error {
+	for _, endpoint := range metadata.Endpoints {
+		if _, err := parseRuntimeEndpointURL(endpoint.URL, manager.GatewayURL); err != nil {
+			return err
+		}
+	}
+	if metadata.SSH == "" {
+		return nil
+	}
+	ssh, err := parseRuntimeSSHURI(metadata.SSH)
+	if err != nil {
+		return err
+	}
+	if ssh.Host != manager.GatewaySSHAddr {
+		return errors.New("runtime SSH address must belong to the declared gateway")
+	}
+	return nil
+}
+
+func parseRuntimeEndpointURL(raw, gatewayURL string) (*url.URL, error) {
+	gateway, err := url.Parse(gatewayURL)
+	if err != nil {
+		return nil, err
+	}
+	address, err := url.Parse(raw)
+	if err != nil || (address.Scheme != "http" && address.Scheme != "https") || address.User != nil || address.Fragment != "" ||
+		validateDNSHost(address.Hostname()) != nil ||
+		address.Scheme != gateway.Scheme || address.Port() != gateway.Port() ||
+		!strings.HasSuffix(strings.ToLower(address.Hostname()), "."+strings.ToLower(gateway.Hostname())) {
+		return nil, errors.New("runtime endpoint address must belong to the declared gateway")
+	}
+	return address, nil
+}
+
+func parseRuntimeSSHURI(raw string) (*url.URL, error) {
+	address, err := url.Parse(raw)
+	if err != nil || address.Scheme != "ssh" || address.User == nil || address.Opaque != "" || address.Path != "" || address.RawQuery != "" || address.ForceQuery || address.Fragment != "" {
+		return nil, errors.New("invalid runtime SSH URI")
+	}
+	host, port, err := net.SplitHostPort(address.Host)
+	if err != nil || host == "" {
+		return nil, errors.New("runtime SSH URI must include a host and port")
+	}
+	number, err := strconv.ParseUint(port, 10, 16)
+	_, password := address.User.Password()
+	if err != nil || number == 0 || password || !runtimeSSHUserPattern.MatchString(address.User.Username()) {
+		return nil, errors.New("invalid runtime SSH user or port")
+	}
+	return address, nil
 }
